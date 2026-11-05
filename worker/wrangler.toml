@@ -1,0 +1,11 @@
+name = "moonlake-rank"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+[vars]
+ALLOWED_ORIGINS = "https://leenamgyeol-spec.github.io,http://localhost:5540"
+
+# 랭킹 저장소 — darok-board와 같은 RATE 네임스페이스를 쓰고, 키 앞에 "moon:"을 붙여 구분한다.
+[[kv_namespaces]]
+binding = "RATE"
+id = "0f4282147d1941bb898cf428572f0d48"
