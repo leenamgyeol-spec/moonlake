@@ -82,7 +82,21 @@ export default {
       return json({ ok: true, id, rank: rank || null });
     }
 
-    // 관리자: 항목 삭제 / 전체 초기화. 비밀번호는 Cloudflare 비밀값 ADMIN_PASSWORD.
+    // 우편함: 내 토큰으로 나에게 온 선물을 받아 가요 (받으면 비워져요)
+    if (url.pathname === '/mail' && req.method === 'POST') {
+      if (!okOrigin) return json({ error: 'origin' }, 403);
+      let d;
+      try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
+      const token = String(d.token || '');
+      if (!/^[0-9a-f]{32,64}$/.test(token)) return json({ error: 'token' }, 400);
+      const id = (await sha256('moonlake:' + token)).slice(0, 16);
+      const key = 'moon:mail:' + id;
+      const box = (await env.RATE.get(key, 'json')) || [];
+      if (box.length) await env.RATE.delete(key);
+      return json({ ok: true, mail: box });
+    }
+
+    // 관리자: 항목 삭제 / 전체 초기화 / 선물 보내기. 비밀번호는 Cloudflare 비밀값 ADMIN_PASSWORD.
     if (url.pathname === '/admin' && req.method === 'POST') {
       if (!okOrigin) return json({ error: 'origin' }, 403);
       const ip = req.headers.get('CF-Connecting-IP') || 'x';
@@ -99,6 +113,24 @@ export default {
       if (d.action === 'reset') {
         await env.RATE.put(BOARD_KEY, '[]');
         return json({ ok: true, removed: board.length });
+      }
+      if (d.action === 'gift') {
+        const id = String(d.id || '');
+        if (!/^[0-9a-f]{16}$/.test(id) || !board.some(e => e.id === id)) return json({ error: 'noplayer' }, 400);
+        const g = d.gift || {};
+        const clamp = (n, max) => Math.max(0, Math.min(max, Math.floor(Number(n) || 0)));
+        const gift = { coins: clamp(g.coins, 1e15), bait: {}, fish: [], msg: String(g.msg || '').replace(/[\u0000-\u001f<>]/g, '').slice(0, 80), at: Date.now() };
+        for (const [k, n] of Object.entries(g.bait || {})) if (/^[a-z]{2,12}$/.test(k) && clamp(n, 1e6)) gift.bait[k] = clamp(n, 1e6);
+        for (const f of (Array.isArray(g.fish) ? g.fish : []).slice(0, 10)) {
+          const sp = clamp(f.sp, 9999), n = clamp(f.n, 50), v = /^[a-z]$/.test(String(f.v)) ? String(f.v) : 'n';
+          if (n) gift.fish.push({ sp, v, n });
+        }
+        if (!gift.coins && !Object.keys(gift.bait).length && !gift.fish.length) return json({ error: 'empty' }, 400);
+        const key = 'moon:mail:' + id;
+        const box = (await env.RATE.get(key, 'json')) || [];
+        box.push(gift);
+        await env.RATE.put(key, JSON.stringify(box.slice(-50)), { expirationTtl: 60 * 60 * 24 * 60 });
+        return json({ ok: true, waiting: box.length });
       }
       if (d.action === 'delete') {
         const next = board.filter(e => e.id !== String(d.id || ''));
