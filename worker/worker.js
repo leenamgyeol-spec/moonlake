@@ -12,6 +12,14 @@ async function sha256(s) {
   return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+// 랭킹 이름에 못 쓰는 말 (공백·기호를 빼고 비교)
+const BAD = ['섹스', '쎅스', '섹쓰', '씨발', '시발', '씨팔', 'ㅅㅂ', 'ㅆㅂ', '병신', 'ㅂㅅ', '좆', '존나', 'ㅈㄴ', '개새', '새끼', '느금', '니애미', '니엄', '애미', '애비', '엠창', '창녀', '보지', '자지', '꼬추', '야르릉',
+  'fuck', 'sex', 'shit', 'bitch', 'porn', 'dick', 'pussy'];
+function isBad(name) {
+  const flat = name.toLowerCase().replace(/[\s\-_.~!@#$%^&*()+=|\\/:;'"`,?0-9]/g, '');
+  return BAD.some(w => flat.includes(w));
+}
+
 function cleanName(s) {
   return String(s || '')
     .replace(/[\u0000-\u001f\u007f<>]/g, '')
@@ -53,6 +61,7 @@ export default {
       const best = Math.floor(Number(d.best));
       if (!/^[0-9a-f]{32,64}$/.test(token)) return json({ error: 'token' }, 400);
       if (!name) return json({ error: 'name' }, 400);
+      if (isBad(name)) return json({ error: 'badname' }, 400);
       if (!Number.isFinite(worth) || worth < 0 || worth > 1e12) return json({ error: 'worth' }, 400);
       if (!(dex >= 0 && dex <= 100) || !(best >= 0 && best <= 10)) return json({ error: 'bad' }, 400);
 
