@@ -63,7 +63,7 @@ export default {
       if (!name) return json({ error: 'name' }, 400);
       if (isBad(name)) return json({ error: 'badname' }, 400);
       if (!Number.isFinite(worth) || worth < 0 || worth > 1e12) return json({ error: 'worth' }, 400);
-      if (!(dex >= 0 && dex <= 100) || !(best >= 0 && best <= 10)) return json({ error: 'bad' }, 400);
+      if (!(dex >= 0 && dex <= 1000) || !(best >= 0 && best <= 30)) return json({ error: 'bad' }, 400);
 
       const id = (await sha256('moonlake:' + token)).slice(0, 16);
       const rlKey = 'moon:rl:' + id;
