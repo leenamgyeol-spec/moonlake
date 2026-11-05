@@ -78,7 +78,13 @@ export class Board {
       return out({ ok: true, id, rank: rank || null });
     }
 
-    // 선물·우편함 기능은 없앴다. 남아 있던 선물은 전부 지운다.
+    if (op === 'mail') {
+      const box = (await this.ctx.storage.get('mail:' + id)) || [];
+      if (box.length) await this.ctx.storage.delete('mail:' + id);
+      return out({ ok: true, mail: box });
+    }
+
+    // 관리자용: 쌓여 있는 선물을 전부 지운다
     if (op === 'purge') {
       const keys = [...(await this.ctx.storage.list({ prefix: 'mail:' })).keys()];
       let gifts = 0;
@@ -107,6 +113,22 @@ export class Board {
         const next = b.filter(e => e.id !== String(d.id || ''));
         await this.ctx.storage.put('board', next);
         return out({ ok: true, removed: b.length - next.length });
+      }
+      if (d.action === 'gift') {
+        const to = String(d.id || '');
+        if (!/^[0-9a-f]{16}$/.test(to) || !b.some(e => e.id === to)) return out({ error: 'noplayer' }, 400);
+        const g = d.gift || {};
+        const gift = { coins: clamp(g.coins, 1e15), bait: {}, fish: [], msg: String(g.msg || '').replace(/[\u0000-\u001f<>]/g, '').slice(0, 80), at: Date.now() };
+        for (const [k, n] of Object.entries(g.bait || {})) if (/^[a-z]{2,12}$/.test(k) && clamp(n, 1e6)) gift.bait[k] = clamp(n, 1e6);
+        for (const fi of (Array.isArray(g.fish) ? g.fish : []).slice(0, 10)) {
+          const sp = clamp(fi.sp, 9999), n = clamp(fi.n, 50), v = /^[a-z]$/.test(String(fi.v)) ? String(fi.v) : 'n';
+          if (n) gift.fish.push({ sp, v, n });
+        }
+        if (!gift.coins && !Object.keys(gift.bait).length && !gift.fish.length) return out({ error: 'empty' }, 400);
+        const box = (await this.ctx.storage.get('mail:' + to)) || [];
+        box.push(gift);
+        await this.ctx.storage.put('mail:' + to, box.slice(-50));
+        return out({ ok: true, waiting: box.length });
       }
       return out({ error: 'bad' }, 400);
     }
@@ -150,7 +172,7 @@ export default {
 
     if (url.pathname === '/top' && req.method === 'GET') return call({ op: 'top' });
 
-    if (req.method !== 'POST' || !['/submit', '/admin'].includes(url.pathname)) return json({ error: 'not found' }, 404);
+    if (req.method !== 'POST' || !['/submit', '/mail', '/admin'].includes(url.pathname)) return json({ error: 'not found' }, 404);
     if (!okOrigin) return json({ error: 'origin' }, 403);
     let d;
     try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
@@ -168,6 +190,13 @@ export default {
       if (!(dex >= 0 && dex <= 1000) || !(best >= 0 && best <= 30)) return json({ error: 'bad' }, 400);
       const id = (await sha256('moonlake:' + token)).slice(0, 16);
       return call({ op: 'submit', id, d: { name, worth, dex, best } });
+    }
+
+    if (url.pathname === '/mail') {
+      const token = String(d.token || '');
+      if (!/^[0-9a-f]{32,64}$/.test(token)) return json({ error: 'token' }, 400);
+      const id = (await sha256('moonlake:' + token)).slice(0, 16);
+      return call({ op: 'mail', id });
     }
 
     // /admin
