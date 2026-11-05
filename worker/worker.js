@@ -1,11 +1,17 @@
 // 달빛 저수지 순자산 랭킹 서버
 // GET  /top     → 상위 50명
 // POST /submit  {token, name, worth, dex, best} → 내 기록 등록/갱신
+// POST /mail    {token} → 나에게 온 선물 받기
+// POST /admin   {password, action: reset | delete | gift}
+//
+// 랭킹 데이터는 Durable Object(Board) 한 곳에서만 읽고 쓴다.
+// 예전에는 KV에 통째로 저장했는데, KV는 지역마다 최대 1분 늦게 맞춰져서
+// 동시에 갱신하면 서로 덮어쓰고 순위가 왔다갔다했다.
 // 플레이어 구분은 브라우저가 만든 비밀 토큰의 해시로 한다. 토큰 자체는 저장하지 않는다.
 
-const BOARD_KEY = 'moon:board';
 const MAX_ENTRIES = 300;
 const MIN_GAP_MS = 8000;
+const MAX_WORTH = 1e16;
 
 async function sha256(s) {
   const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
@@ -28,6 +34,87 @@ function cleanName(s) {
     .slice(0, 12);
 }
 
+const clamp = (n, max) => Math.max(0, Math.min(max, Math.floor(Number(n) || 0)));
+const pub = ({ id, name, worth, dex, best, at }) => ({ id, name, worth, dex, best, at });
+
+// 랭킹 저장소. 요청은 하나씩 순서대로 처리되므로 덮어쓰기가 생기지 않는다.
+export class Board {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async board() {
+    let b = await this.ctx.storage.get('board');
+    if (!b) {
+      // 처음 한 번: 예전 KV 랭킹을 옮겨 온다
+      b = (await this.env.RATE.get('moon:board', 'json')) || [];
+      await this.ctx.storage.put('board', b);
+    }
+    return b;
+  }
+
+  async fetch(req) {
+    const { op, d, ip, id } = await req.json();
+    const out = (o, status = 200) => Response.json({ status, body: o });
+
+    if (op === 'top') {
+      const b = await this.board();
+      return out(b.slice(0, 50).map(pub));
+    }
+
+    if (op === 'submit') {
+      const last = (await this.ctx.storage.get('rl:' + id)) || 0;
+      if (Date.now() - last < MIN_GAP_MS) return out({ error: 'slow' }, 429);
+      await this.ctx.storage.put('rl:' + id, Date.now());
+      const b = await this.board();
+      const entry = { id, name: d.name, worth: d.worth, dex: d.dex, best: d.best, at: Date.now() };
+      const i = b.findIndex(e => e.id === id);
+      if (i >= 0) b[i] = entry; else b.push(entry);
+      b.sort((x, y) => y.worth - x.worth || x.at - y.at);
+      const trimmed = b.slice(0, MAX_ENTRIES);
+      await this.ctx.storage.put('board', trimmed);
+      const rank = trimmed.findIndex(e => e.id === id) + 1;
+      return out({ ok: true, id, rank: rank || null });
+    }
+
+    // 선물·우편함 기능은 없앴다. 남아 있던 선물은 전부 지운다.
+    if (op === 'purge') {
+      const keys = [...(await this.ctx.storage.list({ prefix: 'mail:' })).keys()];
+      let gifts = 0;
+      for (const k of keys) { const box = (await this.ctx.storage.get(k)) || []; gifts += box.length; }
+      if (keys.length) await this.ctx.storage.delete(keys);
+      const old = (await this.env.RATE.list({ prefix: 'moon:mail:' })).keys.map(k => k.name);
+      for (const k of old) await this.env.RATE.delete(k);
+      return out({ ok: true, boxes: keys.length, gifts, oldKv: old.length });
+    }
+
+    if (op === 'admin') {
+      const failKey = 'admfail:' + ip;
+      const f = (await this.ctx.storage.get(failKey)) || { n: 0, at: 0 };
+      if (Date.now() - f.at > 600000) { f.n = 0; }
+      if (f.n >= 5) return out({ error: 'locked' }, 429);
+      if (!this.env.ADMIN_PASSWORD || String(d.password || '') !== this.env.ADMIN_PASSWORD) {
+        await this.ctx.storage.put(failKey, { n: f.n + 1, at: Date.now() });
+        return out({ error: 'password' }, 403);
+      }
+      const b = await this.board();
+      if (d.action === 'reset') {
+        await this.ctx.storage.put('board', []);
+        return out({ ok: true, removed: b.length });
+      }
+      if (d.action === 'delete') {
+        const next = b.filter(e => e.id !== String(d.id || ''));
+        await this.ctx.storage.put('board', next);
+        return out({ ok: true, removed: b.length - next.length });
+      }
+      return out({ error: 'bad' }, 400);
+    }
+
+    return out({ error: 'not found' }, 404);
+  }
+}
+
 export default {
   async fetch(req, env) {
     const origin = req.headers.get('Origin') || '';
@@ -38,22 +125,37 @@ export default {
       'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
       'Access-Control-Allow-Headers': 'Content-Type',
       'Vary': 'Origin',
+      'Cache-Control': 'no-store',
     };
     const json = (o, status = 200) =>
       new Response(JSON.stringify(o), { status, headers: { ...cors, 'Content-Type': 'application/json; charset=utf-8' } });
 
     if (req.method === 'OPTIONS') return new Response(null, { headers: cors });
     const url = new URL(req.url);
-
-    if (url.pathname === '/top' && req.method === 'GET') {
-      const board = (await env.RATE.get(BOARD_KEY, 'json')) || [];
-      return json(board.slice(0, 50).map(({ id, name, worth, dex, best, at }) => ({ id, name, worth, dex, best, at })));
+    const stub = env.BOARD.get(env.BOARD.idFromName('main'));
+    // 남아 있던 선물 지우기: 서버 비밀값을 아는 사람만 (점검 중에도 동작)
+    if (url.pathname === '/purge-mail' && req.method === 'POST') {
+      if (!env.ADMIN_PASSWORD || req.headers.get('X-Admin') !== env.ADMIN_PASSWORD) return json({ error: 'password' }, 403);
+      const r = await stub.fetch('https://board/', { method: 'POST', body: JSON.stringify({ op: 'purge' }) });
+      const { status, body } = await r.json();
+      return json(body, status);
     }
+    // 점검 중: 랭킹·관리자 요청을 모두 막는다 (데이터는 그대로)
+    if (env.MAINTENANCE === '1') return json({ error: 'maintenance' }, 503);
+    const call = async msg => {
+      const r = await stub.fetch('https://board/', { method: 'POST', body: JSON.stringify(msg) });
+      const { status, body } = await r.json();
+      return json(body, status);
+    };
 
-    if (url.pathname === '/submit' && req.method === 'POST') {
-      if (!okOrigin) return json({ error: 'origin' }, 403);
-      let d;
-      try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
+    if (url.pathname === '/top' && req.method === 'GET') return call({ op: 'top' });
+
+    if (req.method !== 'POST' || !['/submit', '/admin'].includes(url.pathname)) return json({ error: 'not found' }, 404);
+    if (!okOrigin) return json({ error: 'origin' }, 403);
+    let d;
+    try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
+
+    if (url.pathname === '/submit') {
       const token = String(d.token || '');
       const name = cleanName(d.name);
       const worth = Math.floor(Number(d.worth));
@@ -62,84 +164,13 @@ export default {
       if (!/^[0-9a-f]{32,64}$/.test(token)) return json({ error: 'token' }, 400);
       if (!name) return json({ error: 'name' }, 400);
       if (isBad(name)) return json({ error: 'badname' }, 400);
-      if (!Number.isFinite(worth) || worth < 0 || worth > 1e12) return json({ error: 'worth' }, 400);
+      if (!Number.isFinite(worth) || worth < 0 || worth > MAX_WORTH) return json({ error: 'worth' }, 400);
       if (!(dex >= 0 && dex <= 1000) || !(best >= 0 && best <= 30)) return json({ error: 'bad' }, 400);
-
       const id = (await sha256('moonlake:' + token)).slice(0, 16);
-      const rlKey = 'moon:rl:' + id;
-      const last = Number(await env.RATE.get(rlKey)) || 0;
-      if (Date.now() - last < MIN_GAP_MS) return json({ error: 'slow' }, 429);
-      await env.RATE.put(rlKey, String(Date.now()), { expirationTtl: 60 });
-
-      const board = (await env.RATE.get(BOARD_KEY, 'json')) || [];
-      const entry = { id, name, worth, dex, best, at: Date.now() };
-      const i = board.findIndex(e => e.id === id);
-      if (i >= 0) board[i] = entry; else board.push(entry);
-      board.sort((a, b) => b.worth - a.worth || a.at - b.at);
-      const trimmed = board.slice(0, MAX_ENTRIES);
-      await env.RATE.put(BOARD_KEY, JSON.stringify(trimmed));
-      const rank = trimmed.findIndex(e => e.id === id) + 1;
-      return json({ ok: true, id, rank: rank || null });
+      return call({ op: 'submit', id, d: { name, worth, dex, best } });
     }
 
-    // 우편함: 내 토큰으로 나에게 온 선물을 받아 가요 (받으면 비워져요)
-    if (url.pathname === '/mail' && req.method === 'POST') {
-      if (!okOrigin) return json({ error: 'origin' }, 403);
-      let d;
-      try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
-      const token = String(d.token || '');
-      if (!/^[0-9a-f]{32,64}$/.test(token)) return json({ error: 'token' }, 400);
-      const id = (await sha256('moonlake:' + token)).slice(0, 16);
-      const key = 'moon:mail:' + id;
-      const box = (await env.RATE.get(key, 'json')) || [];
-      if (box.length) await env.RATE.delete(key);
-      return json({ ok: true, mail: box });
-    }
-
-    // 관리자: 항목 삭제 / 전체 초기화 / 선물 보내기. 비밀번호는 Cloudflare 비밀값 ADMIN_PASSWORD.
-    if (url.pathname === '/admin' && req.method === 'POST') {
-      if (!okOrigin) return json({ error: 'origin' }, 403);
-      const ip = req.headers.get('CF-Connecting-IP') || 'x';
-      const failKey = 'moon:admfail:' + ip;
-      const fails = Number(await env.RATE.get(failKey)) || 0;
-      if (fails >= 5) return json({ error: 'locked' }, 429);
-      let d;
-      try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
-      if (!env.ADMIN_PASSWORD || String(d.password || '') !== env.ADMIN_PASSWORD) {
-        await env.RATE.put(failKey, String(fails + 1), { expirationTtl: 600 });
-        return json({ error: 'password' }, 403);
-      }
-      const board = (await env.RATE.get(BOARD_KEY, 'json')) || [];
-      if (d.action === 'reset') {
-        await env.RATE.put(BOARD_KEY, '[]');
-        return json({ ok: true, removed: board.length });
-      }
-      if (d.action === 'gift') {
-        const id = String(d.id || '');
-        if (!/^[0-9a-f]{16}$/.test(id) || !board.some(e => e.id === id)) return json({ error: 'noplayer' }, 400);
-        const g = d.gift || {};
-        const clamp = (n, max) => Math.max(0, Math.min(max, Math.floor(Number(n) || 0)));
-        const gift = { coins: clamp(g.coins, 1e15), bait: {}, fish: [], msg: String(g.msg || '').replace(/[\u0000-\u001f<>]/g, '').slice(0, 80), at: Date.now() };
-        for (const [k, n] of Object.entries(g.bait || {})) if (/^[a-z]{2,12}$/.test(k) && clamp(n, 1e6)) gift.bait[k] = clamp(n, 1e6);
-        for (const f of (Array.isArray(g.fish) ? g.fish : []).slice(0, 10)) {
-          const sp = clamp(f.sp, 9999), n = clamp(f.n, 50), v = /^[a-z]$/.test(String(f.v)) ? String(f.v) : 'n';
-          if (n) gift.fish.push({ sp, v, n });
-        }
-        if (!gift.coins && !Object.keys(gift.bait).length && !gift.fish.length) return json({ error: 'empty' }, 400);
-        const key = 'moon:mail:' + id;
-        const box = (await env.RATE.get(key, 'json')) || [];
-        box.push(gift);
-        await env.RATE.put(key, JSON.stringify(box.slice(-50)), { expirationTtl: 60 * 60 * 24 * 60 });
-        return json({ ok: true, waiting: box.length });
-      }
-      if (d.action === 'delete') {
-        const next = board.filter(e => e.id !== String(d.id || ''));
-        await env.RATE.put(BOARD_KEY, JSON.stringify(next));
-        return json({ ok: true, removed: board.length - next.length });
-      }
-      return json({ error: 'bad' }, 400);
-    }
-
-    return json({ error: 'not found' }, 404);
+    // /admin
+    return call({ op: 'admin', d, ip: req.headers.get('CF-Connecting-IP') || 'x' });
   },
 };
