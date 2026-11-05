@@ -64,6 +64,9 @@ export class Board {
     }
 
     if (op === 'submit') {
+      // 아직 적용 안 된 압수가 있으면 랭킹 갱신을 받지 않는다 (예전 기록으로 되돌리는 것 방지)
+      const pend = (await this.ctx.storage.get('pen:' + id)) || [];
+      if (pend.length) return out({ error: 'penalty' }, 403);
       const last = (await this.ctx.storage.get('rl:' + id)) || 0;
       if (Date.now() - last < MIN_GAP_MS) return out({ error: 'slow' }, 429);
       await this.ctx.storage.put('rl:' + id, Date.now());
@@ -82,6 +85,13 @@ export class Board {
       const box = (await this.ctx.storage.get('mail:' + id)) || [];
       if (box.length) await this.ctx.storage.delete('mail:' + id);
       return out({ ok: true, mail: box });
+    }
+
+    // 압수 통지: 게임이 켜질 때 받아 가서 적용해요 (받으면 비워져요)
+    if (op === 'penalty') {
+      const list = (await this.ctx.storage.get('pen:' + id)) || [];
+      if (list.length) await this.ctx.storage.delete('pen:' + id);
+      return out({ ok: true, penalty: list });
     }
 
     // 관리자용: 쌓여 있는 선물을 전부 지운다
@@ -114,7 +124,25 @@ export class Board {
         await this.ctx.storage.put('board', next);
         return out({ ok: true, removed: b.length - next.length });
       }
+      if (d.action === 'penalty') {
+        const to = String(d.id || '');
+        const i = b.findIndex(e => e.id === to);
+        if (!/^[0-9a-f]{16}$/.test(to) || i < 0) return out({ error: 'noplayer' }, 400);
+        const amount = clamp(d.amount, MAX_WORTH);
+        if (!amount) return out({ error: 'empty' }, 400);
+        const msg = String(d.msg || '').replace(/[\u0000-\u001f<>]/g, '').slice(0, 120);
+        // 랭킹에서는 바로 깎는다
+        b[i] = { ...b[i], worth: Math.max(0, b[i].worth - amount), at: Date.now() };
+        b.sort((x, y) => y.worth - x.worth || x.at - y.at);
+        await this.ctx.storage.put('board', b);
+        const list = (await this.ctx.storage.get('pen:' + to)) || [];
+        list.push({ amount, msg, at: Date.now() });
+        await this.ctx.storage.put('pen:' + to, list.slice(-20));
+        return out({ ok: true, worth: b.find(e => e.id === to).worth });
+      }
       if (d.action === 'gift') {
+        // 선물 기능 스위치: wrangler.toml의 GIFTS = "1"일 때만 보낼 수 있다
+        if (this.env.GIFTS !== '1') return out({ error: 'giftoff' }, 403);
         const to = String(d.id || '');
         if (!/^[0-9a-f]{16}$/.test(to) || !b.some(e => e.id === to)) return out({ error: 'noplayer' }, 400);
         const g = d.gift || {};
@@ -172,7 +200,7 @@ export default {
 
     if (url.pathname === '/top' && req.method === 'GET') return call({ op: 'top' });
 
-    if (req.method !== 'POST' || !['/submit', '/mail', '/admin'].includes(url.pathname)) return json({ error: 'not found' }, 404);
+    if (req.method !== 'POST' || !['/submit', '/mail', '/penalty', '/admin'].includes(url.pathname)) return json({ error: 'not found' }, 404);
     if (!okOrigin) return json({ error: 'origin' }, 403);
     let d;
     try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
@@ -192,11 +220,11 @@ export default {
       return call({ op: 'submit', id, d: { name, worth, dex, best } });
     }
 
-    if (url.pathname === '/mail') {
+    if (url.pathname === '/mail' || url.pathname === '/penalty') {
       const token = String(d.token || '');
       if (!/^[0-9a-f]{32,64}$/.test(token)) return json({ error: 'token' }, 400);
       const id = (await sha256('moonlake:' + token)).slice(0, 16);
-      return call({ op: 'mail', id });
+      return call({ op: url.pathname === '/mail' ? 'mail' : 'penalty', id });
     }
 
     // /admin

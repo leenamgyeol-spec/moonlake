@@ -5,6 +5,8 @@ compatibility_date = "2026-10-01"
 [vars]
 ALLOWED_ORIGINS = "https://leenamgyeol-spec.github.io,http://localhost:5540"
 MAINTENANCE = "0"
+# 선물 보내기: "1"이면 켜짐, "0"이면 꺼짐
+GIFTS = "0"
 
 # 랭킹·우편함은 Durable Object(Board) 한 곳에 저장한다. 동시에 갱신해도 덮어쓰지 않는다.
 [[durable_objects.bindings]]
