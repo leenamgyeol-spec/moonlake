@@ -73,6 +73,32 @@ export default {
       return json({ ok: true, id, rank: rank || null });
     }
 
+    // 관리자: 항목 삭제 / 전체 초기화. 비밀번호는 Cloudflare 비밀값 ADMIN_PASSWORD.
+    if (url.pathname === '/admin' && req.method === 'POST') {
+      if (!okOrigin) return json({ error: 'origin' }, 403);
+      const ip = req.headers.get('CF-Connecting-IP') || 'x';
+      const failKey = 'moon:admfail:' + ip;
+      const fails = Number(await env.RATE.get(failKey)) || 0;
+      if (fails >= 5) return json({ error: 'locked' }, 429);
+      let d;
+      try { d = await req.json(); } catch { return json({ error: 'bad' }, 400); }
+      if (!env.ADMIN_PASSWORD || String(d.password || '') !== env.ADMIN_PASSWORD) {
+        await env.RATE.put(failKey, String(fails + 1), { expirationTtl: 600 });
+        return json({ error: 'password' }, 403);
+      }
+      const board = (await env.RATE.get(BOARD_KEY, 'json')) || [];
+      if (d.action === 'reset') {
+        await env.RATE.put(BOARD_KEY, '[]');
+        return json({ ok: true, removed: board.length });
+      }
+      if (d.action === 'delete') {
+        const next = board.filter(e => e.id !== String(d.id || ''));
+        await env.RATE.put(BOARD_KEY, JSON.stringify(next));
+        return json({ ok: true, removed: board.length - next.length });
+      }
+      return json({ error: 'bad' }, 400);
+    }
+
     return json({ error: 'not found' }, 404);
   },
 };
